@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from dataclasses import dataclass
 
 import pytest
@@ -158,3 +159,80 @@ async def test_nested_cancellation_inner_called() -> None:
     long_running_agent = await runtime.try_get_underlying_agent_instance(long_running_id, type=LongRunningAgent)
     assert long_running_agent.called
     assert long_running_agent.cancelled
+
+
+@pytest.mark.parametrize("cancel_before_registration", [False, True])
+def test_cancellation_callback_can_query_token(cancel_before_registration: bool) -> None:
+    token = CancellationToken()
+    states: list[bool] = []
+    finished = threading.Event()
+
+    def callback() -> None:
+        states.append(token.is_cancelled())
+        finished.set()
+
+    def cancel_and_register() -> None:
+        if cancel_before_registration:
+            token.cancel()
+        token.add_callback(callback)
+        token.cancel()
+
+    thread = threading.Thread(target=cancel_and_register, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "Cancellation callback deadlocked while reading its token"
+    assert finished.is_set()
+    assert states == [True]
+
+
+@pytest.mark.parametrize("cancel_before_registration", [False, True])
+def test_cancellation_callback_can_register_callback(cancel_before_registration: bool) -> None:
+    token = CancellationToken()
+    calls: list[str] = []
+
+    def callback() -> None:
+        calls.append("outer")
+        token.add_callback(lambda: calls.append("inner"))
+        token.cancel()
+
+    def cancel_and_register() -> None:
+        if cancel_before_registration:
+            token.cancel()
+        token.add_callback(callback)
+        token.cancel()
+
+    thread = threading.Thread(target=cancel_and_register, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "Cancellation callback deadlocked while re-entering its token"
+    assert calls == ["outer", "inner"]
+
+
+@pytest.mark.parametrize("cancel_before_registration", [False, True])
+def test_cancellation_callback_does_not_hold_token_lock(cancel_before_registration: bool) -> None:
+    token = CancellationToken()
+    states: list[bool] = []
+
+    def read_token() -> None:
+        states.append(token.is_cancelled())
+
+    def callback() -> None:
+        thread = threading.Thread(target=read_token, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "Cancellation callback held the token lock while joining cleanup"
+
+    if cancel_before_registration:
+        token.cancel()
+    token.add_callback(callback)
+    token.cancel()
+    assert states == [True]
+
+
+@pytest.mark.asyncio
+async def test_link_future_after_cancellation() -> None:
+    token = CancellationToken()
+    token.cancel()
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    assert token.link_future(future) is future
+    assert future.cancelled()
